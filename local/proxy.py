@@ -162,7 +162,7 @@ class Logging(type(sys)):
         self.__set_error_color()
         self.log('CRITICAL', fmt, *args, **kwargs)
         self.__reset_color()
-logging = sys.modules['logging'] = Logging('logging')
+logging = None
 
 
 class CertUtil(object):
@@ -664,30 +664,38 @@ class HTTPUtil(object):
                         # only output first error
                         logging.warning('create_connection to %s return %r, try again.', addrs, result)
 
-    def create_ssl_connection(self, address, timeout=None, source_address=None):
+    def create_ssl_connection(self, address, timeout=None, source_address=None, create_tcp_socket=None):
         def _create_ssl_connection(ipaddr, timeout, queobj):
             sock = None
             ssl_sock = None
             try:
-                # create a ipv4/ipv6 socket object
-                sock = socket.socket(socket.AF_INET if ':' not in ipaddr[0] else socket.AF_INET6)
-                # set reuseaddr option to avoid 10048 socket error
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                # resize socket recv buffer 8K->32K to improve browser releated application performance
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32*1024)
-                # disable negal algorithm to send http request quickly.
-                sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, True)
-                # set a short timeout to trigger timeout retry more quickly.
-                sock.settimeout(timeout or self.max_timeout)
-                # pick up the certificate
-                server_hostname = 'www.google.com' if address[0].endswith('.appspot.com') else None
-                ssl_sock = self.wrap_socket(sock, do_handshake_on_connect=False, server_hostname=server_hostname)
-                ssl_sock.settimeout(timeout or self.max_timeout)
-                # start connection time record
-                start_time = time.time()
-                # TCP connect
-                ssl_sock.connect(ipaddr)
-                connected_time = time.time()
+                if create_tcp_socket:
+                    start_time = time.time()
+                    sock = create_tcp_socket(ipaddr[0], ipaddr[1], timeout or self.max_timeout)
+                    connected_time = time.time()
+                    server_hostname = 'www.google.com' if address[0].endswith('.appspot.com') else None
+                    ssl_sock = self.wrap_socket(sock, do_handshake_on_connect=False, server_hostname=server_hostname)
+                    ssl_sock.settimeout(timeout or self.max_timeout)
+                else:
+                    # create a ipv4/ipv6 socket object
+                    sock = socket.socket(socket.AF_INET if ':' not in ipaddr[0] else socket.AF_INET6)
+                    # set reuseaddr option to avoid 10048 socket error
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    # resize socket recv buffer 8K->32K to improve browser releated application performance
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32*1024)
+                    # disable negal algorithm to send http request quickly.
+                    sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, True)
+                    # set a short timeout to trigger timeout retry more quickly.
+                    sock.settimeout(timeout or self.max_timeout)
+                    # pick up the certificate
+                    server_hostname = 'www.google.com' if address[0].endswith('.appspot.com') else None
+                    ssl_sock = self.wrap_socket(sock, do_handshake_on_connect=False, server_hostname=server_hostname)
+                    ssl_sock.settimeout(timeout or self.max_timeout)
+                    # start connection time record
+                    start_time = time.time()
+                    # TCP connect
+                    ssl_sock.connect(ipaddr)
+                    connected_time = time.time()
                 # SSL handshake
                 ssl_sock.do_handshake()
                 handshaked_time = time.time()
@@ -912,7 +920,7 @@ class HTTPUtil(object):
             response = None
         return response
 
-    def request(self, method, url, payload=None, headers={}, realhost='', fullurl=False, bufsize=8192, crlf=None, return_sock=None):
+    def request(self, method, url, payload=None, headers={}, realhost='', fullurl=False, bufsize=8192, crlf=None, return_sock=None, create_tcp_socket=None):
         scheme, netloc, path, params, query, fragment = urllib.parse.urlparse(url)
         if netloc.rfind(':') <= netloc.rfind(']'):
             # no port number
@@ -932,7 +940,7 @@ class HTTPUtil(object):
             try:
                 if not self.proxy:
                     if scheme == 'https':
-                        ssl_sock = self.create_ssl_connection((realhost or host, port), self.max_timeout)
+                        ssl_sock = self.create_ssl_connection((realhost or host, port), self.max_timeout, create_tcp_socket=create_tcp_socket)
                         if ssl_sock:
                             sock = ssl_sock.sock
                             del ssl_sock.sock
@@ -1097,8 +1105,12 @@ class Common(object):
         info += '------------------------------------------------------\n'
         return info
 
-common = Common()
-http_util = HTTPUtil(max_window=common.GOOGLE_WINDOW, ssl_validate=common.GAE_VALIDATE or common.PAAS_VALIDATE, ssl_obfuscate=common.GAE_OBFUSCATE, proxy=common.proxy)
+class FakeCommon(object):
+    def __getattr__(self, item):
+        return ''
+
+common = FakeCommon()
+http_util = HTTPUtil(max_window=2, ssl_validate=False, ssl_obfuscate=False, proxy=None)
 
 
 def message_html(self, title, banner, detail=''):
@@ -1166,15 +1178,16 @@ def gae_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
         metadata += ''.join('%s:%s\n' % (k.title(), v) for k, v in headers.items() if k not in skip_headers)
     metadata = zlib.compress(metadata.encode())[2:-4]
     need_crlf = 0 if fetchserver.startswith('https') else common.GAE_CRLF
+    create_tcp_socket = kwargs.get('create_tcp_socket')
     if common.GAE_OBFUSCATE:
         cookie = base64.b64encode(metadata).strip().decode()
         if not payload:
-            response = http_util.request('GET', fetchserver, payload, {'Cookie': cookie}, crlf=need_crlf)
+            response = http_util.request('GET', fetchserver, payload, {'Cookie': cookie}, crlf=need_crlf, create_tcp_socket=create_tcp_socket)
         else:
-            response = http_util.request('POST', fetchserver, payload, {'Cookie': cookie, 'Content-Length': str(len(payload))}, crlf=need_crlf)
+            response = http_util.request('POST', fetchserver, payload, {'Cookie': cookie, 'Content-Length': str(len(payload))}, crlf=need_crlf, create_tcp_socket=create_tcp_socket)
     else:
         payload = b''.join((struct.pack('!h', len(metadata)), metadata, payload))
-        response = http_util.request('POST', fetchserver, payload, {'Content-Length': str(len(payload))}, crlf=need_crlf)
+        response = http_util.request('POST', fetchserver, payload, {'Content-Length': str(len(payload))}, crlf=need_crlf, create_tcp_socket=create_tcp_socket)
     response.app_status = response.status
     if response.status != 200:
         if response.status in (400, 405):
@@ -1205,7 +1218,7 @@ class RangeFetch(object):
     waitsize = 1024*512
     urlfetch = staticmethod(gae_urlfetch)
 
-    def __init__(self, wfile, response, method, url, headers, payload, fetchservers, password, maxsize=0, bufsize=0, waitsize=0, threads=0):
+    def __init__(self, wfile, response, method, url, headers, payload, fetchservers, password, maxsize=0, bufsize=0, waitsize=0, threads=0, create_tcp_socket=None):
         self.wfile = wfile
         self.response = response
         self.command = method
@@ -1220,6 +1233,7 @@ class RangeFetch(object):
         self.threads = threads or self.__class__.threads
         self._stopped = None
         self._last_app_status = {}
+        self.create_tcp_socket = create_tcp_socket
 
     def fetch(self):
         response_status = self.response.status
@@ -1299,7 +1313,7 @@ class RangeFetch(object):
                         fetchserver = random.choice(self.fetchservers)
                         if self._last_app_status.get(fetchserver, 200) >= 500:
                             time.sleep(5)
-                        response = self.urlfetch(self.command, self.url, headers, self.payload, fetchserver, password=self.password)
+                        response = self.urlfetch(self.command, self.url, headers, self.payload, fetchserver, password=self.password, create_tcp_socket=self.create_tcp_socket)
                 except queue.Empty:
                     continue
                 except (socket.error, ssl.SSLError, OSError) as e:
