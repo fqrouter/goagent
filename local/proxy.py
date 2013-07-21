@@ -1106,6 +1106,9 @@ class Common(object):
         return info
 
 class FakeCommon(object):
+    def __init__(self):
+        self.GAE_OBFUSCATE = False
+
     def __getattr__(self, item):
         return ''
 
