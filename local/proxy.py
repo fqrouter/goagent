@@ -1247,21 +1247,23 @@ class RangeFetch(object):
         start, end, length = list(map(int, re.search(r'bytes (\d+)-(\d+)/(\d+)', content_range).group(1, 2, 3)))
         if start == 0:
             response_status = 200
+            response_headers.pop('Content-Range', None)
             response_headers['Content-Length'] = str(length)
         else:
-            response_headers['Content-Range'] = 'bytes %s-%s/%s' % (start, end, length)
+            response_headers['Content-Range'] = 'bytes %s-%s/%s' % (start, length, length)
             response_headers['Content-Length'] = str(length-start)
 
         logging.info('>>>>>>>>>>>>>>> RangeFetch started(%r) %d-%d', self.url, start, end)
-        self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response_status, ''.join('%s: %s\r\n' % (k, v) for k, v in response_headers.items()))).encode())
+        general_resposne = ('HTTP/1.1 %s\r\n%s\r\n' % (response_status, ''.join('%s: %s\r\n' % (k, v) for k, v in response_headers.items()))).encode()
+        self.wfile.write(general_resposne)
 
-        data_queue = queue.PriorityQueue()
-        range_queue = queue.PriorityQueue()
+        data_queue = gevent.queue.PriorityQueue()
+        range_queue = gevent.queue.PriorityQueue()
         range_queue.put((start, end, self.response))
         for begin in range(end+1, length, self.maxsize):
             range_queue.put((begin, min(begin+self.maxsize-1, length-1), None))
         for i in range(self.threads):
-            threading._start_new_thread(self.__fetchlet, (range_queue, data_queue))
+            gevent.spawn(self.__fetchlet, range_queue, data_queue)
         has_peek = hasattr(data_queue, 'peek')
         peek_timeout = 90
         expect_begin = start
