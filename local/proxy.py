@@ -1222,7 +1222,9 @@ class RangeFetch(object):
     waitsize = 1024*512
     urlfetch = staticmethod(gae_urlfetch)
 
-    def __init__(self, wfile, response, method, url, headers, payload, fetchservers, password, maxsize=0, bufsize=0, waitsize=0, threads=0, create_tcp_socket=None):
+    def __init__(self, range_end, auto_ranged, wfile, response, method, url, headers, payload, fetchservers, password, maxsize=0, bufsize=0, waitsize=0, threads=0, create_tcp_socket=None):
+        self.range_end = range_end
+        self.auto_ranged = auto_ranged
         self.wfile = wfile
         self.response = response
         self.command = method
@@ -1243,31 +1245,41 @@ class RangeFetch(object):
         response_status = self.response.status
         response_headers = dict((k.title(), v) for k, v in self.response.getheaders())
         content_range = response_headers['Content-Range']
+        logging.info('auto ranged: %s' % self.auto_ranged)
+        logging.info('original response: %s' % content_range)
         #content_length = response_headers['Content-Length']
         start, end, length = list(map(int, re.search(r'bytes (\d+)-(\d+)/(\d+)', content_range).group(1, 2, 3)))
-        if start == 0:
+        if self.auto_ranged:
             response_status = 200
             response_headers.pop('Content-Range', None)
             response_headers['Content-Length'] = str(length)
         else:
-            response_headers['Content-Range'] = 'bytes %s-%s/%s' % (start, length, length)
-            response_headers['Content-Length'] = str(length-start)
+            if self.range_end:
+                response_headers['Content-Range'] = 'bytes %s-%s/%s' % (start, self.range_end, length)
+                response_headers['Content-Length'] = str(self.range_end-start+1)
+            else:
+                response_headers['Content-Range'] = 'bytes %s-%s/%s' % (start, length-1, length)
+                response_headers['Content-Length'] = str(length - start)
 
-        logging.info('>>>>>>>>>>>>>>> RangeFetch started(%r) %d-%d', self.url, start, end)
+        if self.range_end:
+            logging.info('>>>>>>>>>>>>>>> RangeFetch started(%r) %d-%d', self.url, start, self.range_end)
+        else:
+            logging.info('>>>>>>>>>>>>>>> RangeFetch started(%r) %d-end', self.url, start)
         general_resposne = ('HTTP/1.1 %s\r\n%s\r\n' % (response_status, ''.join('%s: %s\r\n' % (k, v) for k, v in response_headers.items()))).encode()
+        logging.info(general_resposne)
         self.wfile.write(general_resposne)
 
         data_queue = gevent.queue.PriorityQueue()
         range_queue = gevent.queue.PriorityQueue()
         range_queue.put((start, end, self.response))
-        for begin in range(end+1, length, self.maxsize):
+        for begin in range(end+1, self.range_end + 1 if self.range_end else length, self.maxsize):
             range_queue.put((begin, min(begin+self.maxsize-1, length-1), None))
         for i in range(self.threads):
             gevent.spawn(self.__fetchlet, range_queue, data_queue)
         has_peek = hasattr(data_queue, 'peek')
         peek_timeout = 90
         expect_begin = start
-        while expect_begin < length-1:
+        while expect_begin < (self.range_end or (length-1)):
             try:
                 if has_peek:
                     begin, data = data_queue.peek(timeout=peek_timeout)
